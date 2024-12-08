@@ -1,0 +1,67 @@
+
+#include <PubSubClient.h>
+
+// Define idx and other necessary variables
+int idx = 17;  // Example index, can be changed or set dynamically if needed
+int RSSI = 8;  // Example RSSI value (signal strength), adjust as needed
+float waterLevel = 23.0;  // Example water level value, replace with your sensor's data
+
+// MQTT settings
+const char* mqtt_server = "your_mqtt_broker_address";  // Replace with your MQTT broker address
+const int mqtt_port = 1883;  // MQTT port (default 1883)
+const char* mqtt_topic = "sensor/data";  // MQTT topic to publish to
+const char* mqtt_user = "your_username";  // MQTT username (if any)
+const char* mqtt_password = "your_password";  // MQTT password (if any)
+
+WiFiClient espClient;  // WiFi client for MQTT
+PubSubClient client(espClient);  // MQTT client
+
+unsigned long lastMeasureTime = 0;
+const uint32_t MEASURE_INTERVAL = 30000;  // Interval between sending data (30 seconds)
+
+// Function to connect to MQTT broker
+void connectToMQTT() {
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+    if (client.connect("ESP32Client", mqtt_user, mqtt_password)) {
+      Serial.println("Connected to MQTT");
+      client.subscribe(mqtt_topic);  // Subscribe to a topic if needed
+    } else {
+      Serial.print("Failed to connect, rc=");
+      Serial.print(client.state());
+      delay(5000);  // Wait 5 seconds before retrying
+    }
+  }
+}
+
+// Function to send data to MQTT
+void sendToMQTT() {
+  // Format the message in JSON format
+  String jsonMessage = String("{\"idx\":") + String(idx) + ",\"RSSI\":" + String(RSSI) + ",\"nvalue\":0,\"svalue\":\"" + String(waterLevel, 1) + "\"}";
+  
+  // Send the JSON formatted message to the MQTT broker
+  client.publish(mqtt_topic, jsonMessage.c_str());  
+  Serial.println("Sending data to MQTT: " + jsonMessage);
+}
+
+// Reconnect MQTT if disconnected
+void reconnectMQTT() {
+  if (!client.connected()) {
+    connectToMQTT();  // Attempt to reconnect
+  }
+}
+
+// In the main loop:
+void loop() {
+  // Ensure MQTT client is connected
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();  // Keep the MQTT connection alive
+  
+  // Send the water level data to MQTT every 30 seconds
+  if (millis() - lastMeasureTime >= MEASURE_INTERVAL) {
+    sendToMQTT();  // Send data to MQTT
+    lastMeasureTime = millis();  // Reset the time
+  }
+}

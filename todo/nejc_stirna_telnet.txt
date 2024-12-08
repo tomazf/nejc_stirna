@@ -1,0 +1,600 @@
+#include <Wire.h>
+#include <PCF8575.h>
+#include <Button2.h>
+#include <EEPROM.h>
+#include <Streaming.h>
+#include <CircularBuffer.hpp>
+
+#include <ESP8266WiFi.h>        // Include the Wi-Fi library
+
+const char* ssid     = "sr3casr3ca";         // The SSID (name) of the Wi-Fi network you want to connect to
+const char* password = "Poletje123";     // The password of the Wi-Fi network
+
+// Ultrasonic sensor and LED configurations
+#define SENSOR_TIMEOUT 5000   // Timeout in ms for sensor response (5 seconds)
+#define PCF8575_ADDR 0x20     // I2C address of the PCF8575
+#define BAUD_RATE 9600
+#define BUFFER_SIZE 128
+
+PCF8575 pcf(PCF8575_ADDR);
+
+// Calibration and input
+#define TRIMMER_PIN A0
+#define BTN_MIN_PIN D3
+#define BTN_MAX_PIN D5
+#define EEPROM_SIZE 4
+#define BTN_DOUBLECLICK_MS 400
+#define SERIAL_BUFFER_SIZE 64     // Typical size of the serial buffer
+
+// Constants
+const uint32_t MEASURE_INTERVAL = 30000; // 30 seconds
+const int LED_COUNT = 12;
+const int EEPROM_MIN_ADDR = 0; // EEPROM address for minLevel
+const int EEPROM_MAX_ADDR = 1; // EEPROM address for maxLevel
+
+// Variables
+uint8_t minLevel = 0, maxLevel = 255;        // Calibration levels
+unsigned long lastMeasureTime = 0;
+unsigned long lastSerialReadTime = 0;     // Time of the last successful read
+
+// Calibration mode
+bool inCalibrationMode = false;
+bool calibratingMin = false;
+bool receivedData = true;
+
+String lastSensorData = "";                         // Stores the most recent valid sensor data
+
+unsigned long lastAverageTime = 0;
+const unsigned long averagingInterval = 10000;      // 10 seconds
+int distanceSum = 0;
+int measurementCount = 0;
+bool debugEnabled = true;                           // Set to true to enable debug messages
+bool enableWifi = true;                             // Set to true to enable debug messages
+uint8_t currentMapped = 0;
+
+// Track connection status
+bool clientWasDisconnected = false;
+
+// Button objects
+Button2 buttonMin(BTN_MIN_PIN);
+Button2 buttonMax(BTN_MAX_PIN);
+
+// Telnet
+WiFiServer telnetServer(23);            // Telnet server on port 23
+WiFiClient telnetClient;                // Client for Telnet
+
+// buffer
+CircularBuffer<uint8_t, BUFFER_SIZE> ringBuffer; // Ring buffer for received data
+
+void setup() {
+  // Initialize serial communication for sensor
+  Serial.begin(BAUD_RATE);
+  delay(200);
+  Serial.println();
+  Serial.println("SETUP start...");
+
+  EEPROM.begin(EEPROM_SIZE);
+
+
+  // Initialize I2C for PCF8575
+  Wire.begin();
+  pcf.begin();
+
+  // Set PCF8575 pins as outputs
+  for (int i = 0; i < LED_COUNT; i++) {
+    pcf.pinMode(i, OUTPUT);
+    pcf.digitalWrite(i, HIGH); // Turn LEDs off (active low)
+  }
+
+  // Attach button callbacks
+  buttonMin.setDoubleClickTime(BTN_DOUBLECLICK_MS);
+  buttonMax.setDoubleClickTime(BTN_DOUBLECLICK_MS);
+  buttonMin.setDoubleClickHandler(handleMinDoublePress);
+  buttonMax.setDoubleClickHandler(handleMaxDoublePress);
+
+  // Read calibration data from EEPROM
+  minLevel = EEPROM.read(EEPROM_MIN_ADDR) | (EEPROM.read(EEPROM_MIN_ADDR + 1) << 8);
+  maxLevel = EEPROM.read(EEPROM_MAX_ADDR) | (EEPROM.read(EEPROM_MAX_ADDR + 1) << 8);
+
+  // display min and max from EEPROM
+  Serial << "vaules from memory - MIN: " << minLevel << " MAX: " << maxLevel;
+  Serial.println();
+  Serial.println("SETUP done!");
+
+  // WiFi
+  if (enableWifi) connectWifi();
+
+  // DEMO
+  runLEDDemo();
+  Serial.println("DEMO done!");
+}
+
+void loop() {
+  // Process button events
+  buttonMin.loop();
+  buttonMax.loop();
+
+
+  if (!receivedData && !inCalibrationMode) knightRiderEffect(70);
+
+  // Handle calibration mode
+  if (inCalibrationMode) {
+    handleCalibration();
+  }
+
+  //else {
+  // read Serial
+  checkSerial();
+
+  // Process packets
+  processPackets();
+
+  //doAverage
+  doAverage();
+  //  }
+
+  // checkTelnet
+  checkTelnet();
+}
+
+void checkTelnet()
+{
+  // Check for new Telnet client
+  if (telnetServer.hasClient()) {
+    if (telnetClient.connected()) {
+      // Disconnect previous client
+      if (debugEnabled) {
+        Serial.println("Existing Telnet client disconnected.");
+      }
+      telnetClient.stop();
+      clientWasDisconnected = true; // Mark client as disconnected
+    }
+    // Accept new client
+    telnetClient = telnetServer.available();
+    if (debugEnabled) {
+      Serial.println("New Telnet client connected.");
+    }
+    clientWasDisconnected = false; // Reset disconnect state
+  }
+
+  // Check if the client has disconnected
+  if (telnetClient && !telnetClient.connected()) {
+    if (!clientWasDisconnected && debugEnabled) {
+      Serial.println("Telnet client disconnected.");
+      clientWasDisconnected = true; // Mark the client as disconnected
+    }
+    telnetClient.stop();
+  }
+}
+
+void connectWifi()
+{
+  WiFi.begin(ssid, password); // Connect to the network
+  Serial.print("Connecting to WiFi... ");
+
+  int i = 0;                       // Counter for retries
+  unsigned long startAttemptTime = millis(); // Record the start time
+
+  while (WiFi.status() != WL_CONNECTED) { // Wait for Wi-Fi to connect
+    delay(1000); // Wait 1 second
+    Serial.print(++i); Serial.print(' ');
+
+    // Check if 30 seconds have passed
+    if (millis() - startAttemptTime > 30000) {
+      Serial.println("\nFailed to connect to WiFi within 30 seconds.");
+      break; // Exit the loop
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nConnected! IP Address: ");
+    Serial.println(WiFi.localIP()); // Print the assigned IP address
+    telnetServer.begin();
+    telnetServer.setNoDelay(true);
+    Serial.println("Telnet server started.");
+  } else {
+    Serial.println("WiFi connection failed. Please check your settings.");
+  }
+}
+
+void checkSerial()
+{
+  // Read data asynchronously from hardware serial
+  while (Serial.available() > 0) {
+    uint8_t byte = Serial.read();
+    ringBuffer.push(byte); // Add byte to the ring buffer
+  }
+}
+
+void doAverage()
+{
+  // Check if data is being received
+  if (millis() - lastAverageTime >= averagingInterval) {
+    if (measurementCount == 0 && debugEnabled) {
+      receivedData = false;
+      Serial.println("Warning: No valid data received in the last 10 seconds.");
+      if (telnetClient && telnetClient.connected()) {
+        telnetClient.println("Warning: No valid data received in the last 10 seconds.");
+      }
+    }
+    else
+    {
+      // Calculate and output average every 10 seconds
+      uint8_t average = calculateMappedAverage();
+      if (!inCalibrationMode) updateLEDs(average); // Update the LED display based on the distance
+      else
+      {
+        if (calibratingMin)
+          Serial.print("calibration MAX: ");
+        else
+          Serial.print("calibration MIN: ");
+        Serial.println(currentMapped);
+      }
+    }
+    // Reset the averaging variables
+    distanceSum = 0;
+    measurementCount = 0;
+    lastAverageTime = millis();
+  }
+}
+
+void processPackets() {
+
+  // Ensure at least 4 bytes are available to form a packet
+  while (ringBuffer.size() >= 4) {
+    // Peek at the first byte to check for packet start
+    if (ringBuffer[0] == 0xFF) {
+      // Extract packet
+      uint8_t hiByte = ringBuffer[1];
+      uint8_t loByte = ringBuffer[2];
+      uint8_t crc = ringBuffer[3];
+
+      // Valid packet, calculate distance
+      uint16_t distance = (hiByte << 8) | loByte;
+
+      // Accumulate for averaging
+      distanceSum += distance;
+      measurementCount++;
+
+      // Remove 4 bytes of the processed packet
+      for (int i = 0; i < 4; i++) {
+        ringBuffer.shift();
+      }
+    } else {
+      // Discard the first byte if it does not indicate the start of a packet
+      if (debugEnabled) {
+        Serial.println("Invalid start byte, discarding.");
+      }
+      ringBuffer.shift();
+      receivedData = false;
+    }
+  }
+}
+
+uint8_t calculateMappedAverage() {
+  if (measurementCount == 0) {
+    return 0; // Return 0 if no measurements
+  }
+
+  receivedData = true;
+  // Calculate average distance
+  uint16_t averageDistance = distanceSum / measurementCount;
+
+  // Map distance to 0–255 range
+  uint8_t mapped = map(averageDistance, 200, 4500, 0, 255);
+  if (debugEnabled) {
+    Serial << "avg (mapped): " << mapped << " (" << averageDistance / 10 << " cm)";
+    Serial.println();
+  }
+
+  currentMapped = mapped;
+  return mapped;
+}
+
+void updateLEDs(int distance) {
+  // Map distance to LED range
+  //int level = constrain(map(distance, minLevel, maxLevel, 0, LED_COUNT), 0, LED_COUNT);
+
+  int level = 0;
+
+  // Ensure minLevel and maxLevel are valid
+  if (minLevel < maxLevel && distance >= 0) {
+    level = map(distance, minLevel, maxLevel, LED_COUNT, 0);
+
+    // Constrain the result to the valid range
+    level = constrain(level, 0, LED_COUNT);
+  } else {
+    // Handle invalid calibration data
+    Serial.println("Invalid MIN and MAX level!");
+    Serial.println("Invalid calibration data or distance. Check minLevel and maxLevel.");
+    //level = 0;    // Default to all LEDs off
+
+    // first&last LED ON
+    clearLED();
+    pcf.digitalWrite(0, LOW);               // LED ON
+    pcf.digitalWrite(LED_COUNT - 1, LOW);   // LED ON
+    return;
+  }
+
+  if (debugEnabled) {
+    Serial << "CURR: minLevel: " << minLevel << " maxLevel: " << maxLevel << " distance: " << distance;
+    Serial.println();
+  }
+
+  // first LED is always ON
+  pcf.digitalWrite(0, LOW); // LED ON
+
+  // Update LEDs based on the level
+  for (int i = 1; i < LED_COUNT; i++) {
+    if (i < level) {
+      pcf.digitalWrite(i, LOW); // LED ON
+    } else {
+      pcf.digitalWrite(i, HIGH); // LED OFF
+    }
+  }
+}
+
+/*
+  void blinkError() {
+  static unsigned long lastBlinkTime = 0;
+  static bool blinkState = false;
+  unsigned long currentTime = millis();
+
+  // Blink two LEDs for error indication
+  if (currentTime - lastBlinkTime >= 1000) { // Blink every second
+    lastBlinkTime = currentTime;
+    blinkState = !blinkState;
+
+    pcf.digitalWrite(0, blinkState ? LOW : HIGH);          // Blink first LED
+    pcf.digitalWrite(LED_COUNT - 1, blinkState ? LOW : HIGH); // Blink last LED
+  }
+  }
+*/
+
+void handleMinDoublePress(Button2 &btn) {
+  if (!inCalibrationMode) {
+    enterCalibrationMode(true); // Enter calibration mode for MIN
+  } else if (calibratingMin) {
+    exitCalibrationMode(); // Exit calibration mode
+  }
+}
+
+void handleMaxDoublePress(Button2 &btn) {
+  if (!inCalibrationMode) {
+    enterCalibrationMode(false); // Enter calibration mode for MAX
+  } else if (!calibratingMin) {
+    exitCalibrationMode(); // Exit calibration mode
+  }
+}
+
+void enterCalibrationMode(bool isMin) {
+  inCalibrationMode = true;
+  calibratingMin = isMin;
+
+  clearLED();       // turn off all LEDs
+
+  // Blink LEDs to indicate calibration mode
+  if (isMin) {
+    blinkCalibrationLEDs(0, 4, 800); // Blink lower 6 LEDs
+  } else {
+    blinkCalibrationLEDs(8, 12, 800); // Blink upper 6 LEDs
+  }
+}
+
+void exitCalibrationMode() {
+  // Save calibration data before exiting calibration mode
+  if (calibratingMin) {
+    minLevel = getLevel();
+    blinkCalibrationLEDs(0, 4, 100);
+  } else {
+    maxLevel = getLevel();
+    blinkCalibrationLEDs(8, 12, 100);
+  }
+  saveCalibrationData();
+  /*
+    Serial.print(minLevel);
+    Serial.print(" ");
+    Serial.println(maxLevel);
+    Serial.println("CALIBRATION data saved");
+  */
+  Serial << "min: " << minLevel << " - max: " << maxLevel << "\n";
+  Serial.println("CALIBRATION data saved");
+
+  // samo za blink save visual
+  //blinkUpperOrLowerHalf(calibratingMin);
+
+  // Now exit calibration mode
+  inCalibrationMode = false;
+}
+
+uint8_t getLevel()
+{
+  return currentMapped;
+  //return map(analogRead(TRIMMER_PIN), 0, 1023, 0, 255);
+}
+
+void handleCalibration() {
+  // Read the current trimmer value as an integer
+  uint8_t level = getLevel();
+
+  // Dynamically update LEDs to reflect the trimmer value
+  //  updateLEDs(level);
+
+  // The actual saving happens in exitCalibrationMode()
+
+  // samo izpis
+  //Serial.print("calibration...");
+  //Serial.println(level);
+}
+
+void blinkCalibrationLEDs(int start, int end, int duration_time) {
+  for (int i = 0; i < 2; i++) { // Blink twice
+    for (int j = start; j < end; j++) {
+      pcf.digitalWrite(j, LOW); // LED ON
+    }
+    delay(duration_time);
+    for (int j = start; j < end; j++) {
+      pcf.digitalWrite(j, HIGH); // LED OFF
+    }
+    delay(duration_time);
+  }
+}
+
+void saveCalibrationData() {
+  // Save minLevel and maxLevel to EEPROM (1 byte each)
+  EEPROM.write(EEPROM_MIN_ADDR, minLevel);          // Store lower byte of minLevel
+  //  EEPROM.write(EEPROM_MIN_ADDR + 1, (minLevel >> 8) & 0xFF); // Store upper byte of minLevel
+  EEPROM.write(EEPROM_MAX_ADDR, maxLevel);          // Store lower byte of maxLevel
+  // EEPROM.write(EEPROM_MAX_ADDR + 1, (maxLevel >> 8) & 0xFF); // Store upper byte of maxLevel
+
+  // Commit the data to ensure it is written to flash
+  EEPROM.commit();
+}
+
+void runLEDDemo() {
+  // Slow Blink: All LEDs blink slowly
+  for (int i = 0; i < 3; i++) {
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, LOW); // Turn LED ON
+    }
+    delay(500);
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, HIGH); // Turn LED OFF
+    }
+    delay(500);
+  }
+
+  // Fast Blink: All LEDs blink quickly
+  for (int i = 0; i < 5; i++) {
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, LOW); // Turn LED ON
+    }
+    delay(100);
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, HIGH); // Turn LED OFF
+    }
+    delay(100);
+  }
+
+  // Turn All LEDs ON, then OFF
+  for (int led = 0; led < LED_COUNT; led++) {
+    pcf.digitalWrite(led, LOW); // Turn LED ON
+  }
+  delay(1000);
+  for (int led = 0; led < LED_COUNT; led++) {
+    pcf.digitalWrite(led, HIGH); // Turn LED OFF
+  }
+  delay(1000);
+
+  /*
+    // Knight Rider Effect
+    for (int i = 0; i < 3; i++) { // Loop back and forth 3 times
+      for (int led = 0; led < LED_COUNT; led++) {
+        pcf.digitalWrite(led, LOW); // Turn LED ON
+        delay(50);
+        pcf.digitalWrite(led, HIGH); // Turn LED OFF
+      }
+      for (int led = LED_COUNT - 2; led >= 0; led--) { // Go back in reverse
+        pcf.digitalWrite(led, LOW); // Turn LED ON
+        delay(50);
+        pcf.digitalWrite(led, HIGH); // Turn LED OFF
+      }
+    }
+  */
+
+  // Blink from Both Ends to Center
+  for (int i = 0; i < 3; i++) { // Repeat effect 3 times
+    for (int j = 0; j < (LED_COUNT + 1) / 2; j++) {
+      pcf.digitalWrite(j, LOW); // Turn outer LEDs ON
+      pcf.digitalWrite(LED_COUNT - j - 1, LOW);
+      delay(120 - i * 20);
+      pcf.digitalWrite(j, HIGH); // Turn outer LEDs OFF
+      pcf.digitalWrite(LED_COUNT - j - 1, HIGH);
+    }
+  }
+
+  for (int i = 0; i < 3; i++)
+  {
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, LOW); // Turn LED OFF
+    }
+    delay(50);
+    for (int led = 0; led < LED_COUNT; led++) {
+      pcf.digitalWrite(led, HIGH); // Turn LED OFF
+    }
+    delay(50);
+  }
+
+  // Ensure all LEDs are OFF at the end
+  for (int led = 0; led < LED_COUNT; led++) {
+    pcf.digitalWrite(led, HIGH); // Turn LED OFF
+  }
+}
+
+/*
+  void blinkUpperOrLowerHalf(bool upperHalf) {
+  int startIdx, endIdx;
+
+  // Define the range based on upperHalf flag
+  if (upperHalf) {
+    startIdx = 0;
+    endIdx = LED_COUNT / 2;  // Upper half
+  } else {
+    startIdx = LED_COUNT / 2;
+    endIdx = LED_COUNT;     // Lower half
+  }
+
+  // Blink the selected part 5 times
+  for (int i = 0; i < 5; i++) {
+    // Turn on the selected half
+    for (int led = startIdx; led < endIdx; led++) {
+      pcf.digitalWrite(led, LOW); // Turn LED ON (active low)
+    }
+    delay(100);  // Blink duration
+    // Turn off the selected half
+    for (int led = startIdx; led < endIdx; led++) {
+      pcf.digitalWrite(led, HIGH); // Turn LED OFF
+    }
+    delay(100);  // Blink duration
+  }
+  }
+*/
+
+void clearLED()
+{
+  for (int i = 0; i < LED_COUNT; i++) {
+    pcf.digitalWrite(i, HIGH); // Turn LED OFF
+  }
+}
+
+void knightRiderEffect(unsigned long interval) {
+  static int currentLED = 0;            // Tracks the current LED index
+  static int direction = 1;            // 1 = forward, -1 = backward
+  static unsigned long lastUpdate = 0; // Tracks the last update time
+
+  // Check if the interval has elapsed
+  unsigned long currentTime = millis();
+  if (currentTime - lastUpdate >= interval) {
+    lastUpdate = currentTime;
+
+    // Turn off all LEDs
+    for (int i = 0; i < LED_COUNT; i++) {
+      pcf.digitalWrite(i, HIGH); // Turn LED OFF (active LOW)
+    }
+
+    // Turn on the current LED
+    pcf.digitalWrite(currentLED, LOW); // Turn LED ON (active LOW)
+
+    // Update the LED index for the next step
+    currentLED += direction;
+
+    // Change direction if we reach the ends
+    if (currentLED >= LED_COUNT) {
+      currentLED = LED_COUNT - 2; // Step back into range
+      direction = -1;             // Reverse direction
+    } else if (currentLED < 0) {
+      currentLED = 1;             // Step back into range
+      direction = 1;              // Reverse direction
+    }
+  }
+}
